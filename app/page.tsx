@@ -493,36 +493,6 @@ function Explorer({
           })}
         </div>
 
-        <div>
-          <div className='flex items-center gap-2 text-slate-200'>
-            <span>⌄</span>
-            <span className='text-cyan-300'>▣</span>
-            <span>src</span>
-          </div>
-          <div className='mt-3 ml-5 space-y-3'>
-            <div className='flex items-center gap-2 text-slate-200'>
-              <span>⌄</span>
-              <span className='text-emerald-300'>▣</span>
-              <span>projects</span>
-            </div>
-            <div className='ml-6 space-y-3'>
-              <div className='flex items-center gap-2 text-slate-200'>
-                <span>⌄</span>
-                <span className='text-emerald-300'>▣</span>
-                <span className='truncate'>{activeProject.slug}</span>
-              </div>
-              <div className={`file-row ${!activeProject.leaped ? "file-row-active" : ""}`}>
-                <span className='text-rose-300'>{`{}`}</span>
-                <span>procrastination_mindset.json</span>
-              </div>
-              <div className={`file-row ${activeProject.leaped ? "file-row-active" : ""}`}>
-                <span className='text-cyan-300'>{`<>`}</span>
-                <span>disciplined_engineer.ts</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
         <div className='rounded-[6px] border border-slate-700/80 bg-slate-900/70 p-4'>
           <div className='text-xs uppercase tracking-[0.16em] text-slate-400'>
             Task Queue
