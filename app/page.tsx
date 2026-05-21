@@ -7,6 +7,7 @@ import {
   useMemo,
   useState,
 } from "react"
+import { QRCodeSVG } from "qrcode.react"
 import {
   approvalGoal,
   approvalThreshold,
@@ -42,10 +43,12 @@ export default function Home() {
   const description = useGitLeapStore((state) => state.description)
   const leapEffect = useGitLeapStore((state) => state.leapEffect)
   const hasHydrated = useGitLeapStore((state) => state.hasHydrated)
+  const hasSyncedMockApi = useGitLeapStore((state) => state.hasSyncedMockApi)
   const setCommand = useGitLeapStore((state) => state.setCommand)
   const setDescription = useGitLeapStore((state) => state.setDescription)
   const setHydrated = useGitLeapStore((state) => state.setHydrated)
   const createProject = useGitLeapStore((state) => state.createProject)
+  const removeProject = useGitLeapStore((state) => state.removeProject)
   const switchProject = useGitLeapStore((state) => state.switchProject)
   const runCode = useGitLeapStore((state) => state.runCode)
   const commit = useGitLeapStore((state) => state.commit)
@@ -57,9 +60,23 @@ export default function Home() {
   const approvePullRequest = useGitLeapStore(
     (state) => state.approvePullRequest,
   )
+  const syncPullRequestApprovals = useGitLeapStore(
+    (state) => state.syncPullRequestApprovals,
+  )
+  const syncWorkspaceFromMockApi = useGitLeapStore(
+    (state) => state.syncWorkspaceFromMockApi,
+  )
+  const saveWorkspaceToMockApi = useGitLeapStore(
+    (state) => state.saveWorkspaceToMockApi,
+  )
 
   const [projectName, setProjectName] = useState("")
   const [projectTask, setProjectTask] = useState("")
+  const [approvalPending, setApprovalPending] = useState(false)
+  const [approvalError, setApprovalError] = useState<{
+    message: string
+    projectId: string
+  } | null>(null)
 
   const activeProject = useMemo(
     () =>
@@ -86,7 +103,27 @@ export default function Home() {
   const consensusReached = approvals >= approvalThreshold
   const hasSavedSession =
     hasHydrated &&
-    (projects.length > 1 || projects.some((project) => isProjectStarted(project)))
+    (projects.length > 1 ||
+      projects.some((project) => isProjectStarted(project)))
+  const requestHref = useMemo(
+    () => (activeProject ? peerRequestHref(activeProject) : "#"),
+    [activeProject],
+  )
+  const requestQrHref = useMemo(() => {
+    if (!activeProject) {
+      return ""
+    }
+
+    if (typeof window === "undefined") {
+      return requestHref
+    }
+
+    try {
+      return new URL(requestHref, window.location.origin).toString()
+    } catch {
+      return requestHref
+    }
+  }, [activeProject, requestHref])
 
   useEffect(() => {
     const unsubscribe = useGitLeapStore.persist.onFinishHydration(() => {
@@ -101,6 +138,44 @@ export default function Home() {
 
     return unsubscribe
   }, [setHydrated])
+
+  useEffect(() => {
+    if (!hasHydrated || hasSyncedMockApi) {
+      return
+    }
+
+    const syncWorkspace = async () => {
+      try {
+        await syncWorkspaceFromMockApi()
+      } catch {
+        // Local persistence remains the fallback when MockAPI is unreachable.
+      }
+    }
+
+    void syncWorkspace()
+  }, [hasHydrated, hasSyncedMockApi, syncWorkspaceFromMockApi])
+
+  useEffect(() => {
+    if (!hasHydrated || !hasSyncedMockApi) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void saveWorkspaceToMockApi().catch(() => {
+        // The next state change will try again; the UI should stay responsive.
+      })
+    }, 500)
+
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [
+    activeProjectId,
+    hasHydrated,
+    hasSyncedMockApi,
+    projects,
+    saveWorkspaceToMockApi,
+  ])
 
   useEffect(() => {
     if (!leapEffect || leaped) {
@@ -119,6 +194,27 @@ export default function Home() {
       window.clearTimeout(clearTimer)
     }
   }, [clearLeapEffect, completeLeap, leapEffect, leaped])
+
+  useEffect(() => {
+    if (!hasHydrated) {
+      return
+    }
+
+    const syncApprovals = async () => {
+      try {
+        await syncPullRequestApprovals()
+      } catch {
+        // The review panel stays usable with locally persisted approvals.
+      }
+    }
+
+    void syncApprovals()
+    const intervalId = window.setInterval(syncApprovals, 15000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [activeProjectId, hasHydrated, syncPullRequestApprovals])
 
   const statusCopy = useMemo(() => {
     const projectTaskName = activeProject?.task ?? "this project"
@@ -217,9 +313,42 @@ export default function Home() {
     setProjectTask("")
   }
 
+  function confirmRemoveProject(project: ProjectSession) {
+    const confirmed = window.confirm(
+      `Remove "${project.name}"? This cannot be undone.`,
+    )
+
+    if (confirmed) {
+      removeProject(project.id)
+    }
+  }
+
   function pickTask(task: ProjectTask) {
     setCommand(task.message)
     setDescription(task.description)
+  }
+
+  async function requestPeerApproval() {
+    if (approvalPending) {
+      return
+    }
+
+    setApprovalError(null)
+    setApprovalPending(true)
+
+    try {
+      await approvePullRequest()
+    } catch (error) {
+      setApprovalError({
+        message:
+          error instanceof Error
+            ? error.message
+            : "Peer approval request failed.",
+        projectId: activeProjectId,
+      })
+    } finally {
+      setApprovalPending(false)
+    }
   }
 
   if (!activeProject) {
@@ -258,6 +387,7 @@ export default function Home() {
           onPickTask={pickTask}
           onProjectNameChange={setProjectName}
           onProjectTaskChange={setProjectTask}
+          onRemoveProject={confirmRemoveProject}
           onSwitchProject={switchProject}
         />
 
@@ -294,10 +424,18 @@ export default function Home() {
         <ReviewPanel
           activeProject={activeProject}
           approvals={approvals}
+          approvalError={
+            approvalError?.projectId === activeProject.id
+              ? approvalError.message
+              : null
+          }
           approvalPercent={approvalPercent}
+          approvalPending={approvalPending}
+          requestHref={requestHref}
+          qrHref={requestQrHref}
           thresholdPercent={thresholdPercent}
           consensusReached={consensusReached}
-          onApprove={approvePullRequest}
+          onApprove={requestPeerApproval}
         />
       </div>
     </main>
@@ -396,6 +534,7 @@ function Explorer({
   onPickTask,
   onProjectNameChange,
   onProjectTaskChange,
+  onRemoveProject,
   onSwitchProject,
 }: {
   activeProject: ProjectSession
@@ -407,6 +546,7 @@ function Explorer({
   onPickTask: (task: ProjectTask) => void
   onProjectNameChange: (value: string) => void
   onProjectTaskChange: (value: string) => void
+  onRemoveProject: (project: ProjectSession) => void
   onSwitchProject: (projectId: string) => void
 }) {
   const progress = Math.min(
@@ -457,38 +597,62 @@ function Explorer({
           </div>
           {projects.map((project) => {
             const isActive = project.id === activeProjectId
+            const canRemove = projects.length > 1
             const projectProgress = Math.min(
               100,
               Math.round((project.commits.length / 6) * 100),
             )
 
             return (
-              <button
+              <div
                 key={project.id}
-                type='button'
-                onClick={() => onSwitchProject(project.id)}
-                className={`w-full rounded-[4px] border px-3 py-2 text-left transition ${
+                className={`rounded-[4px] border transition ${
                   isActive
                     ? "border-emerald-300 bg-emerald-300/10 text-emerald-100"
                     : "border-slate-700 bg-slate-950/60 text-slate-300 hover:border-cyan-300"
                 }`}
               >
-                <div className='flex min-w-0 items-center justify-between gap-3'>
-                  <span className='truncate font-bold'>{project.name}</span>
-                  <span className='shrink-0 text-xs text-slate-400'>
-                    {project.commits.length}/6
-                  </span>
+                <div className='flex min-w-0 items-start gap-2 px-3 py-2'>
+                  <button
+                    type='button'
+                    onClick={() => onSwitchProject(project.id)}
+                    className='min-w-0 flex-1 text-left'
+                    aria-current={isActive ? "true" : undefined}
+                  >
+                    <div className='flex min-w-0 items-center justify-between gap-3'>
+                      <span className='truncate font-bold'>{project.name}</span>
+                      <span className='shrink-0 text-xs text-slate-400'>
+                        {project.commits.length}/6
+                      </span>
+                    </div>
+                    <div className='mt-1 truncate text-xs text-slate-500'>
+                      {project.task}
+                    </div>
+                  </button>
+                  <button
+                    type='button'
+                    disabled={!canRemove}
+                    onClick={() => onRemoveProject(project)}
+                    className='grid h-7 w-7 shrink-0 place-items-center rounded-[4px] border border-slate-700 bg-slate-900 text-xs font-black text-slate-400 transition hover:border-rose-300 hover:bg-rose-500/10 hover:text-rose-100 disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:border-slate-700 disabled:hover:bg-slate-900 disabled:hover:text-slate-400'
+                    aria-label={`Remove ${project.name}`}
+                    title={
+                      canRemove
+                        ? `Remove ${project.name}`
+                        : "At least one project is required"
+                    }
+                  >
+                    X
+                  </button>
                 </div>
-                <div className='mt-1 truncate text-xs text-slate-500'>
-                  {project.task}
+                <div className='px-3 pb-2'>
+                  <div className='h-1 overflow-hidden rounded-full bg-slate-800'>
+                    <div
+                      className='h-full bg-cyan-300 transition-all duration-500'
+                      style={{ width: `${projectProgress}%` }}
+                    />
+                  </div>
                 </div>
-                <div className='mt-2 h-1 overflow-hidden rounded-full bg-slate-800'>
-                  <div
-                    className='h-full bg-cyan-300 transition-all duration-500'
-                    style={{ width: `${projectProgress}%` }}
-                  />
-                </div>
-              </button>
+              </div>
             )
           })}
         </div>
@@ -613,7 +777,9 @@ function CodeEditor({
             <span className='select-none border-r border-slate-700/70 pr-3 text-right text-slate-500'>
               {index + 1}
             </span>
-            <code className='min-w-0 px-5 text-slate-200'>{line}</code>
+            <code className='min-w-0 whitespace-pre px-5 text-slate-200'>
+              {line}
+            </code>
           </div>
         ))}
       </div>
@@ -703,7 +869,10 @@ function CommitSandbox({
 
         <div className='h-[220px] overflow-auto p-4 font-mono text-sm'>
           {terminalLines.map((line, index) => (
-            <div key={`${line.text}-${index}`} className={terminalTone(line.tone)}>
+            <div
+              key={`${line.text}-${index}`}
+              className={terminalTone(line.tone)}
+            >
               {line.text}
             </div>
           ))}
@@ -768,7 +937,9 @@ function CommitSandbox({
                 : "border-slate-600 text-slate-400"
             }`}
           >
-            {leaped ? "Project Already Deployed" : "Execute Git Push / Deploy Soul"}
+            {leaped
+              ? "Project Already Deployed"
+              : "Execute Git Push / Deploy Soul"}
           </button>
         </div>
       </div>
@@ -779,19 +950,28 @@ function CommitSandbox({
 function ReviewPanel({
   activeProject,
   approvals,
+  approvalError,
   approvalPercent,
+  approvalPending,
+  requestHref,
+  qrHref,
   thresholdPercent,
   consensusReached,
   onApprove,
 }: {
   activeProject: ProjectSession
   approvals: number
+  approvalError: string | null
   approvalPercent: number
+  approvalPending: boolean
+  requestHref: string
+  qrHref: string
   thresholdPercent: number
   consensusReached: boolean
   onApprove: () => void
 }) {
   const approvalGoalReached = approvals >= approvalGoal
+  const approvalDisabled = approvalGoalReached || approvalPending
 
   return (
     <aside className='bg-[#121929] p-5'>
@@ -843,20 +1023,53 @@ function ReviewPanel({
 
       <button
         type='button'
-        disabled={approvalGoalReached}
+        disabled={approvalDisabled}
         onClick={onApprove}
         className={`mt-6 flex h-14 w-full items-center justify-center rounded-[4px] border font-mono text-sm font-bold tracking-[0.08em] transition ${
           approvalGoalReached
             ? "border-emerald-300 bg-emerald-300/15 text-emerald-100"
-            : "border-cyan-200 bg-[#11192d] text-cyan-100 hover:bg-cyan-300/10 hover:shadow-[0_0_26px_rgba(34,211,238,0.25)]"
+            : approvalPending
+              ? "border-cyan-200 bg-cyan-300/10 text-cyan-100 opacity-80"
+              : "border-cyan-200 bg-[#11192d] text-cyan-100 hover:bg-cyan-300/10 hover:shadow-[0_0_26px_rgba(34,211,238,0.25)]"
         }`}
       >
         {approvalGoalReached
           ? "Approval Goal Filled"
-          : consensusReached
-            ? "Consensus Reached: Add Approval"
-            : "↻ Simulate Peer Approve"}
+          : approvalPending
+            ? "Requesting Peer Approval..."
+            : consensusReached
+              ? "Consensus Reached: Add Approval"
+              : "Request Peer Approval"}
       </button>
+
+      <a
+        href={requestHref}
+        target='_blank'
+        rel='noreferrer'
+        className='mt-3 flex h-10 w-full items-center justify-center rounded-[4px] border border-slate-600 bg-slate-950/60 font-mono text-xs font-bold uppercase tracking-[0.12em] text-slate-300 transition hover:border-cyan-200 hover:text-cyan-100'
+      >
+        Open Request Page
+      </a>
+
+      {qrHref && qrHref !== "#" ? (
+        <div className='mt-3 rounded-md border border-slate-700 bg-slate-950/60 p-3'>
+          <div className='font-mono text-[11px] font-bold uppercase tracking-[0.12em] text-slate-300'>
+            Scan QR To Open Request
+          </div>
+          <div className='mt-2 flex justify-center rounded-sm bg-white p-3'>
+            <QRCodeSVG value={qrHref} size={140} />
+          </div>
+        </div>
+      ) : null}
+
+      {approvalError ? (
+        <div
+          role='alert'
+          className='mt-3 rounded-[4px] border border-rose-300/60 bg-rose-500/10 px-3 py-2 text-sm text-rose-100'
+        >
+          {approvalError}
+        </div>
+      ) : null}
 
       <div
         className={`mt-6 rounded-[6px] border p-4 text-sm leading-6 ${
@@ -896,7 +1109,9 @@ function LeapOverlay() {
   )
 }
 
-function statusClasses(tone: "success" | "error" | "warning" | "info" | "muted") {
+function statusClasses(
+  tone: "success" | "error" | "warning" | "info" | "muted",
+) {
   return {
     success: "border-emerald-300/60 bg-emerald-400/10 text-emerald-200",
     error: "border-rose-300/60 bg-rose-500/15 text-rose-100",
@@ -965,14 +1180,17 @@ function commitsToCodeLines(project: ProjectSession, commits: CommitEntry[]) {
   const lines: ReactNode[] = [
     <span key='0' className='text-slate-300'>{`{`}</span>,
     <span key='project'>
+      {"  "}
       <span className='text-rose-300'>{quoted("project")}</span>:{" "}
       <span className='text-emerald-300'>{quoted(project.name)}</span>,
     </span>,
     <span key='task'>
+      {"  "}
       <span className='text-rose-300'>{quoted("task")}</span>:{" "}
       <span className='text-emerald-300'>{quoted(project.task)}</span>,
     </span>,
     <span key='commits'>
+      {"  "}
       <span className='text-rose-300'>{quoted("commits")}</span>:{" "}
       <span className='text-slate-300'>[</span>
     </span>,
@@ -981,26 +1199,28 @@ function commitsToCodeLines(project: ProjectSession, commits: CommitEntry[]) {
   commits.forEach((commit, idx) => {
     lines.push(
       <span key={`commit-${idx}`}>
-        {"  "}
+        {"    "}
         <span className='text-slate-300'>{`{`}</span>
       </span>,
       <span key={`msg-${idx}`}>
-        {"    "}
+        {"      "}
         <span className='text-rose-300'>{quoted("message")}</span>:{" "}
         <span className='text-emerald-300'>{quoted(commit.message)}</span>,
       </span>,
       <span key={`desc-${idx}`}>
-        {"    "}
+        {"      "}
         <span className='text-rose-300'>{quoted("description")}</span>:{" "}
         <span className='text-emerald-300'>{quoted(commit.description)}</span>,
       </span>,
-      <span key={`time-${idx}`}>
-        {"    "}
-        <span className='text-rose-300'>{quoted("timestamp")}</span>:{" "}
-        <span className='text-amber-200'>{commit.timestamp}</span>
+      <span key={`day-${idx}`}>
+        {"      "}
+        <span className='text-rose-300'>{quoted("day")}</span>:{" "}
+        <span className='text-emerald-300'>
+          {quoted(commitDayLabel(commit.timestamp, idx))}
+        </span>
       </span>,
       <span key={`close-${idx}`}>
-        {"  "}
+        {"    "}
         <span className='text-slate-300'>
           {idx < commits.length - 1 ? `},` : `}`}
         </span>
@@ -1011,7 +1231,7 @@ function commitsToCodeLines(project: ProjectSession, commits: CommitEntry[]) {
   if (commits.length === 0) {
     lines.push(
       <span key='empty'>
-        {"  "}
+        {"    "}
         <span className='text-slate-500'>{"// No commits yet"}</span>
       </span>,
     )
@@ -1019,9 +1239,11 @@ function commitsToCodeLines(project: ProjectSession, commits: CommitEntry[]) {
 
   lines.push(
     <span key='close-array'>
+      {"  "}
       <span className='text-slate-300'>],</span>
     </span>,
     <span key='progress'>
+      {"  "}
       <span className='text-rose-300'>{quoted("progress")}</span>:{" "}
       <span className='text-amber-200'>{Math.min(commits.length, 6)}</span>
       <span className='text-slate-300'>/</span>
@@ -1037,4 +1259,28 @@ function commitsToCodeLines(project: ProjectSession, commits: CommitEntry[]) {
 
 function quoted(value: string) {
   return JSON.stringify(value)
+}
+
+function commitDayLabel(timestamp: number, index: number) {
+  const date = new Date(timestamp)
+
+  if (Number.isNaN(date.getTime())) {
+    return `Day ${index + 1}`
+  }
+
+  return `Day ${index + 1} - ${new Intl.DateTimeFormat("en-US", {
+    day: "numeric",
+    month: "short",
+    weekday: "long",
+    year: "numeric",
+  }).format(date)}`
+}
+
+function peerRequestHref(project: ProjectSession) {
+  const query = new URLSearchParams({
+    projectName: project.name,
+    task: project.task,
+  })
+
+  return `/request/${encodeURIComponent(project.id)}?${query.toString()}`
 }

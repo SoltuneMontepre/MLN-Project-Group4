@@ -37,8 +37,11 @@ export type ProjectSession = {
   approvals: number
 }
 
-export const approvalGoal = 40
+export const approvalGoal = 20
 export const approvalThreshold = 32
+
+const peerApprovalEndpoint = "/api/peer-approvals"
+const workspaceEndpoint = "/api/workspace"
 
 const defaultProjectId = "project-default"
 const defaultProjectName = "MLN Study Discipline"
@@ -77,6 +80,7 @@ type GitLeapActions = {
   setDescription: (description: string) => void
   appendTerminal: (lines: TerminalLine[]) => void
   createProject: (name: string, task: string) => void
+  removeProject: (projectId: string) => void
   switchProject: (projectId: string) => void
   runCode: () => void
   commit: (message: string, description: string) => void
@@ -85,7 +89,10 @@ type GitLeapActions = {
   completeLeap: () => void
   clearLeapEffect: () => void
   resetSimulation: () => void
-  approvePullRequest: () => void
+  syncWorkspaceFromMockApi: () => Promise<void>
+  saveWorkspaceToMockApi: () => Promise<void>
+  approvePullRequest: () => Promise<void>
+  syncPullRequestApprovals: () => Promise<void>
 }
 
 type GitLeapTransientState = {
@@ -93,6 +100,7 @@ type GitLeapTransientState = {
   description: string
   leapEffect: boolean
   hasHydrated: boolean
+  hasSyncedMockApi: boolean
 }
 
 export type GitLeapState = PersistedGitLeapState &
@@ -214,6 +222,7 @@ const getInitialTransientState = (): GitLeapTransientState => ({
   description: "",
   leapEffect: false,
   hasHydrated: false,
+  hasSyncedMockApi: false,
 })
 
 const activeProjectFrom = (state: PersistedGitLeapState) =>
@@ -237,6 +246,16 @@ const updateActiveProject = (
   }
 }
 
+const updateProjectById = (
+  state: GitLeapState,
+  projectId: string,
+  update: (project: ProjectSession) => ProjectSession,
+) => ({
+  projects: state.projects.map((project) =>
+    project.id === projectId ? update(project) : project,
+  ),
+})
+
 export const isProjectStarted = (project: ProjectSession) =>
   project.hasRunCode ||
   project.commits.length > 0 ||
@@ -252,6 +271,172 @@ export const isProjectReadyForLeap = (project: ProjectSession) =>
   !project.leaped
 
 const quoteCommand = (value: string) => JSON.stringify(value)
+
+const asRecord = (value: unknown) =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+
+const responseRecords = (payload: unknown) => {
+  const record = asRecord(payload)
+  const nested = asRecord(record?.data)
+
+  return [record, nested].filter(
+    (value): value is Record<string, unknown> => value !== null,
+  )
+}
+
+const numberFromRecord = (
+  records: Record<string, unknown>[],
+  keys: string[],
+) => {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = record[key]
+
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return value
+      }
+    }
+  }
+
+  return null
+}
+
+const stringFromRecord = (
+  records: Record<string, unknown>[],
+  keys: string[],
+) => {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = record[key]
+
+      if (typeof value === "string" && value.trim().length > 0) {
+        return value.trim()
+      }
+    }
+  }
+
+  return null
+}
+
+const approvalAcceptedFrom = (records: Record<string, unknown>[]) => {
+  for (const record of records) {
+    const approved = record.approved ?? record.accepted
+
+    if (typeof approved === "boolean") {
+      return approved
+    }
+  }
+
+  return null
+}
+
+const readResponseJson = async (response: Response) => {
+  try {
+    return (await response.json()) as unknown
+  } catch {
+    return null
+  }
+}
+
+const peerApprovalErrorFrom = (payload: unknown, status: number) => {
+  const message = stringFromRecord(responseRecords(payload), [
+    "error",
+    "message",
+  ])
+
+  return message ?? `Peer approval API failed with status ${status}.`
+}
+
+const peerApprovalDetailsFrom = (payload: unknown) => {
+  const records = responseRecords(payload)
+
+  return {
+    accepted: approvalAcceptedFrom(records),
+    approvals:
+      typeof payload === "number" && Number.isFinite(payload)
+        ? payload
+        : numberFromRecord(records, [
+            "approvals",
+            "totalApprovals",
+            "approvalCount",
+            "count",
+          ]),
+    message: stringFromRecord(records, ["message"]),
+    reviewer: stringFromRecord(records, ["reviewer", "peer", "approvedBy"]),
+  }
+}
+
+const nextApprovalCount = (
+  currentApprovals: number,
+  payload: unknown,
+) => {
+  const details = peerApprovalDetailsFrom(payload)
+  const reportedApprovals =
+    details.approvals === null
+      ? null
+      : Math.min(approvalGoal, Math.max(0, Math.round(details.approvals)))
+
+  if (details.accepted === false) {
+    return reportedApprovals ?? currentApprovals
+  }
+
+  if (reportedApprovals === null || reportedApprovals <= currentApprovals) {
+    return Math.min(approvalGoal, currentApprovals + 1)
+  }
+
+  return reportedApprovals
+}
+
+const workspaceRecordFrom = (payload: unknown) => {
+  const record = asRecord(payload)
+  const candidates = [
+    asRecord(record?.workspace),
+    asRecord(record?.data),
+    record,
+  ].filter((value): value is Record<string, unknown> => value !== null)
+
+  return (
+    candidates.find((candidate) => Array.isArray(candidate.projects)) ?? null
+  )
+}
+
+const workspaceStateFrom = (payload: unknown) => {
+  const record = workspaceRecordFrom(payload)
+
+  if (!record || !Array.isArray(record.projects)) {
+    return null
+  }
+
+  const projects = record.projects.map((project, index) =>
+    normalizeProject(
+      (asRecord(project) as Partial<ProjectSession> | null) ?? undefined,
+      index,
+    ),
+  )
+
+  if (projects.length === 0) {
+    return null
+  }
+
+  const activeProjectId =
+    typeof record.activeProjectId === "string" &&
+    projects.some((project) => project.id === record.activeProjectId)
+      ? record.activeProjectId
+      : projects[0].id
+
+  return { activeProjectId, projects }
+}
+
+const workspaceErrorFrom = (payload: unknown, status: number) => {
+  const message = stringFromRecord(responseRecords(payload), [
+    "error",
+    "message",
+  ])
+
+  return message ?? `Workspace API failed with status ${status}.`
+}
 
 const normalizeProject = (
   project: Partial<ProjectSession> | undefined,
@@ -381,6 +566,37 @@ export const useGitLeapStore = create<GitLeapState>()(
           leapEffect: false,
         }))
       },
+
+      removeProject: (projectId) =>
+        set((state) => {
+          if (
+            state.projects.length <= 1 ||
+            !state.projects.some((project) => project.id === projectId)
+          ) {
+            return {}
+          }
+
+          const projects = state.projects.filter(
+            (project) => project.id !== projectId,
+          )
+          const shouldChooseNextActive =
+            state.activeProjectId === projectId ||
+            !projects.some((project) => project.id === state.activeProjectId)
+
+          return {
+            projects,
+            activeProjectId: shouldChooseNextActive
+              ? projects[0].id
+              : state.activeProjectId,
+            ...(shouldChooseNextActive
+              ? {
+                  command: "",
+                  description: "",
+                  leapEffect: false,
+                }
+              : {}),
+          }
+        }),
 
       switchProject: (projectId) =>
         set((state) => {
@@ -665,17 +881,152 @@ export const useGitLeapStore = create<GitLeapState>()(
           ...updateActiveProject(state, (current) =>
             createProjectSession(current.id, current.name, current.task, current.createdAt),
           ),
-          ...getInitialTransientState(),
+          command: "",
+          description: "",
+          leapEffect: false,
           hasHydrated: true,
+          hasSyncedMockApi: state.hasSyncedMockApi,
         })),
 
-      approvePullRequest: () =>
+      syncWorkspaceFromMockApi: async () => {
+        try {
+          const response = await fetch(workspaceEndpoint, { cache: "no-store" })
+          const payload = await readResponseJson(response)
+
+          if (!response.ok) {
+            set({ hasSyncedMockApi: true })
+            throw new Error(workspaceErrorFrom(payload, response.status))
+          }
+
+          const workspace = workspaceStateFrom(payload)
+
+          if (!workspace) {
+            set({ hasSyncedMockApi: true })
+            return
+          }
+
+          set({
+            ...workspace,
+            command: "",
+            description: "",
+            leapEffect: false,
+            hasSyncedMockApi: true,
+          })
+        } catch (error) {
+          set({ hasSyncedMockApi: true })
+
+          throw error
+        }
+      },
+
+      saveWorkspaceToMockApi: async () => {
+        const state = get()
+        const response = await fetch(workspaceEndpoint, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            activeProjectId: state.activeProjectId,
+            projects: state.projects,
+          }),
+        })
+        const payload = await readResponseJson(response)
+
+        if (!response.ok) {
+          throw new Error(workspaceErrorFrom(payload, response.status))
+        }
+      },
+
+      approvePullRequest: async () => {
+        const project = activeProjectFrom(get())
+
+        if (!project || project.approvals >= approvalGoal) {
+          return
+        }
+
+        const response = await fetch(peerApprovalEndpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            approvalGoal,
+            currentApprovals: project.approvals,
+            projectId: project.id,
+            projectName: project.name,
+            task: project.task,
+          }),
+        })
+        const payload = await readResponseJson(response)
+
+        if (!response.ok) {
+          throw new Error(peerApprovalErrorFrom(payload, response.status))
+        }
+
         set((state) =>
-          updateActiveProject(state, (project) => ({
-            ...project,
-            approvals: Math.min(approvalGoal, project.approvals + 1),
+          updateProjectById(state, project.id, (current) => {
+            const approvals = nextApprovalCount(current.approvals, payload)
+            const details = peerApprovalDetailsFrom(payload)
+            const reviewer = details.reviewer
+              ? ` by ${details.reviewer}`
+              : ""
+            const unchanged = approvals <= current.approvals
+
+            return {
+              ...current,
+              approvals,
+              terminalLines: appendLines(current.terminalLines, [
+                {
+                  tone: unchanged ? "muted" : "success",
+                  text: unchanged
+                    ? details.message ?? "Peer approval API returned no change."
+                    : `Peer approval${reviewer}: ${approvals}/${approvalGoal} approvals recorded.`,
+                },
+              ]),
+            }
+          }),
+        )
+      },
+
+      syncPullRequestApprovals: async () => {
+        const project = activeProjectFrom(get())
+
+        if (!project) {
+          return
+        }
+
+        const params = new URLSearchParams({
+          approvalGoal: String(approvalGoal),
+          projectId: project.id,
+        })
+        const response = await fetch(`${peerApprovalEndpoint}?${params}`, {
+          cache: "no-store",
+        })
+        const payload = await readResponseJson(response)
+
+        if (!response.ok) {
+          throw new Error(peerApprovalErrorFrom(payload, response.status))
+        }
+
+        const details = peerApprovalDetailsFrom(payload)
+
+        if (details.approvals === null) {
+          return
+        }
+
+        const remoteApprovals = Math.min(
+          approvalGoal,
+          Math.max(0, Math.round(details.approvals)),
+        )
+
+        set((state) =>
+          updateProjectById(state, project.id, (current) => ({
+            ...current,
+            approvals: Math.max(current.approvals, remoteApprovals),
           })),
-        ),
+        )
+      },
     }),
     {
       name: "git-leap-compiler-session",
